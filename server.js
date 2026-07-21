@@ -54,58 +54,6 @@ let signingKeyPromise;
 let cachedProviderToken = null;
 let providerTokenCreatedAt = 0;
 
-
-function describeSupabaseKey(key) {
-  if (key.startsWith("sb_secret_")) {
-    return {
-      keyType: "Supabase secret key",
-      expectedServerKey: true,
-    };
-  }
-
-  if (key.startsWith("sb_publishable_")) {
-    return {
-      keyType: "Supabase publishable key",
-      expectedServerKey: false,
-    };
-  }
-
-  if (key.startsWith("eyJ")) {
-    try {
-      const payloadPart = key.split(".")[1];
-      const normalized = payloadPart
-        .replace(/-/g, "+")
-        .replace(/_/g, "/");
-
-      const payload = JSON.parse(
-        Buffer.from(normalized, "base64").toString("utf8")
-      );
-
-      return {
-        keyType: "Legacy JWT key",
-        jwtRole: payload.role || "unknown",
-        expectedServerKey: payload.role === "service_role",
-      };
-    } catch {
-      return {
-        keyType: "Unrecognized JWT",
-        expectedServerKey: false,
-      };
-    }
-  }
-
-  return {
-    keyType: "Unknown key format",
-    expectedServerKey: false,
-  };
-}
-
-console.log(
-  "Supabase server key check:",
-  describeSupabaseKey(process.env.SUPABASE_SERVICE_ROLE_KEY)
-);
-
-
 function getSigningKey() {
   signingKeyPromise ??= importPKCS8(PRIVATE_KEY, "ES256");
   return signingKeyPromise;
