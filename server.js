@@ -321,12 +321,27 @@ app.post("/webhooks/calls", async (request, response) => {
   try {
     const { caller, tokens } = await loadCallData(call);
 
-    if (tokens.length === 0) {
-      return response.status(202).json({
-        delivered: 0,
-        reason: "No active VoIP token for callee",
-      });
-    }
+	console.log("[VOIP TOKENS] Lookup result", {
+	  callId: call.id,
+	  calleeId: call.callee_id,
+	  environment: APNS_ENVIRONMENT,
+	  tokenCount: tokens.length,
+	  tokenSuffixes: tokens.map(({ token }) => token.slice(-8)),
+	});    
+	
+	if (tokens.length === 0) {
+	  console.warn("[VOIP TOKENS] No active token for callee", {
+	    callId: call.id,
+	    calleeId: call.callee_id,
+	    requiredPlatform: "ios",
+	    requiredEnvironment: APNS_ENVIRONMENT,
+	  });
+
+	  return response.status(202).json({
+	    delivered: 0,
+	    reason: "No active VoIP token for callee",
+	  });
+	}
 
     const callerName =
       caller?.display_name?.trim() ||
