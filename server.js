@@ -50,6 +50,17 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "64kb" }));
 
+app.use((req, _res, next) => {
+  console.log("[HTTP REQUEST]", {
+    timestamp: new Date().toISOString(),
+    method: req.method,
+    path: req.path,
+    userAgent: req.get("user-agent") || null,
+  });
+
+  next();
+});
+
 let signingKeyPromise;
 let cachedProviderToken = null;
 let providerTokenCreatedAt = 0;
@@ -263,6 +274,15 @@ app.get("/health", (_request, response) => {
 });
 
 app.post("/webhooks/calls", async (request, response) => {
+  console.log("[VOIP WEBHOOK] Request received", {
+    timestamp: new Date().toISOString(),
+    type: request.body?.type || null,
+    schema: request.body?.schema || null,
+    table: request.body?.table || null,
+    callId: request.body?.record?.id || null,
+    status: request.body?.record?.status || null,
+  });
+
   const suppliedSecret =
     request.get("x-global-qall-webhook-secret") || "";
 
@@ -418,8 +438,14 @@ app.use((error, _request, response, _next) => {
   response.status(500).json({ error: "Internal server error" });
 });
 
+
 app.listen(PORT, () => {
   console.log(
     `Global Qall VoIP push server listening on port ${PORT}`,
   );
+  console.log("VoIP server configuration", {
+    apnsEnvironment: APNS_ENVIRONMENT,
+    apnsHost: APNS_HOST,
+    apnsTopic: APNS_TOPIC,
+  });
 });
