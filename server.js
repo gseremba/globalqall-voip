@@ -377,6 +377,16 @@ app.post("/webhooks/calls", async (request, response) => {
 
           const reason = result.body?.reason;
 
+          console.log("[APNS RESPONSE]", {
+            tokenSuffix: token.slice(-8),
+            statusCode: result.statusCode,
+            apnsId: result.apnsId,
+            reason: reason ?? null,
+            body: result.body,
+            topic: APNS_TOPIC,
+            environment: APNS_ENVIRONMENT,
+          });
+
           if (
             result.statusCode === 410 ||
             reason === "BadDeviceToken" ||
@@ -425,18 +435,6 @@ app.post("/webhooks/calls", async (request, response) => {
       )
     );
 	
-    const reason = result.body?.reason;	
-
-    console.log("[APNS RESPONSE]", {
-      tokenSuffix: token.slice(-8),
-      statusCode: result.statusCode,
-      apnsId: result.apnsId,
-      reason: result.body?.reason ?? null,
-      body: result.body,
-      topic: APNS_TOPIC,
-      environment: APNS_ENVIRONMENT,
-    });
-
     return response
       .status(delivered > 0 ? 200 : 502)
       .json({
