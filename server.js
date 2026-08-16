@@ -23,6 +23,12 @@ for (const name of required) {
 }
 
 const PORT = Number(process.env.PORT || 3000);
+const TURN_TOKEN_TTL_SECONDS = 3600;
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TURN_CONFIGURED = Boolean(
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+);
 const APNS_ENVIRONMENT = process.env.APPLE_APNS_ENVIRONMENT;
 const APNS_HOST =
   APNS_ENVIRONMENT === "production"
@@ -50,70 +56,9 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "64kb" }));
 
-app.use((req, _res, next) => {
-  console.log("[HTTP REQUEST]", {
-    timestamp: new Date().toISOString(),
-    method: req.method,
-    path: req.path,
-    userAgent: req.get("user-agent") || null,
-  });
-
-  next();
-});
-
 let signingKeyPromise;
 let cachedProviderToken = null;
 let providerTokenCreatedAt = 0;
-
-function describeSupabaseKey(key) {
-  if (key.startsWith("sb_secret_")) {
-    return {
-      keyType: "Supabase secret key",
-      expectedServerKey: true,
-    };
-  }
-
-  if (key.startsWith("sb_publishable_")) {
-    return {
-      keyType: "Supabase publishable key",
-      expectedServerKey: false,
-    };
-  }
-
-  if (key.startsWith("eyJ")) {
-    try {
-      const payloadPart = key.split(".")[1];
-      const normalized = payloadPart
-        .replace(/-/g, "+")
-        .replace(/_/g, "/");
-
-      const payload = JSON.parse(
-        Buffer.from(normalized, "base64").toString("utf8")
-      );
-
-      return {
-        keyType: "Legacy JWT key",
-        jwtRole: payload.role || "unknown",
-        expectedServerKey: payload.role === "service_role",
-      };
-    } catch {
-      return {
-        keyType: "Unrecognized JWT",
-        expectedServerKey: false,
-      };
-    }
-  }
-
-  return {
-    keyType: "Unknown key format",
-    expectedServerKey: false,
-  };
-}
-
-console.log(
-  "Supabase server key check:",
-  describeSupabaseKey(process.env.SUPABASE_SERVICE_ROLE_KEY)
-);
 
 function getSigningKey() {
   signingKeyPromise ??= importPKCS8(PRIVATE_KEY, "ES256");
@@ -220,6 +165,93 @@ function sendApnsRequest(deviceToken, payload, providerToken) {
   });
 }
 
+async function requireAuthenticatedUser(request, response) {
+  const authorization = request.get("authorization") || "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+
+  if (!match) {
+    response.status(401).json({
+      error: "Missing bearer token",
+    });
+    return null;
+  }
+
+  const accessToken = match[1];
+
+  const { data, error } = await supabase.auth.getUser(accessToken);
+
+  if (error || !data?.user) {
+    response.status(401).json({
+      error: "Invalid or expired session",
+    });
+    return null;
+  }
+
+  return data.user;
+}
+
+async function createTwilioNetworkTraversalToken() {
+  if (!TURN_CONFIGURED) {
+    throw new Error("TURN_NOT_CONFIGURED");
+  }
+
+  const url =
+    `https://api.twilio.com/2010-04-01/Accounts/` +
+    `${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Tokens.json`;
+
+  const basicAuth = Buffer.from(
+    `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+  ).toString("base64");
+
+  const body = new URLSearchParams({
+    Ttl: String(TURN_TOKEN_TTL_SECONDS),
+  });
+
+  const twilioResponse = await fetch(url, {
+    method: "POST",
+    headers: {
+      authorization: `Basic ${basicAuth}`,
+      "content-type": "application/x-www-form-urlencoded",
+      accept: "application/json",
+    },
+    body,
+  });
+
+  const payload = await twilioResponse.json().catch(() => null);
+
+  if (!twilioResponse.ok) {
+    const message =
+      payload?.message ||
+      payload?.detail ||
+      `Twilio NTS request failed (${twilioResponse.status})`;
+
+    throw new Error(message);
+  }
+
+  const iceServers = Array.isArray(payload?.ice_servers)
+    ? payload.ice_servers
+        .filter((server) => server && server.urls)
+        .map((server) => ({
+          urls: server.urls,
+          ...(server.username
+            ? { username: server.username }
+            : {}),
+          ...(server.credential
+            ? { credential: server.credential }
+            : {}),
+        }))
+    : [];
+
+  if (iceServers.length === 0) {
+    throw new Error("Twilio returned no ICE servers");
+  }
+
+  return {
+    iceServers,
+    ttl: Number(payload?.ttl || TURN_TOKEN_TTL_SECONDS),
+  };
+}
+
 async function deactivateToken(token, reason) {
   const { error } = await supabase
     .from("voip_push_tokens")
@@ -270,19 +302,51 @@ app.get("/health", (_request, response) => {
     ok: true,
     service: "global-qall-voip-push",
     apnsEnvironment: APNS_ENVIRONMENT,
+    turnConfigured: TURN_CONFIGURED,
   });
 });
 
-app.post("/webhooks/calls", async (request, response) => {
-  console.log("[VOIP WEBHOOK] Request received", {
-    timestamp: new Date().toISOString(),
-    type: request.body?.type || null,
-    schema: request.body?.schema || null,
-    table: request.body?.table || null,
-    callId: request.body?.record?.id || null,
-    status: request.body?.record?.status || null,
-  });
+app.get("/api/turn-credentials", async (request, response) => {
+  try {
+    const user = await requireAuthenticatedUser(request, response);
 
+    if (!user) {
+      return;
+    }
+
+    if (!TURN_CONFIGURED) {
+      return response.status(503).json({
+        error: "TURN is not configured on this server",
+      });
+    }
+
+    const token = await createTwilioNetworkTraversalToken();
+
+    console.log("TURN credentials issued", {
+      userId: user.id,
+      iceServerCount: token.iceServers.length,
+      ttl: token.ttl,
+    });
+
+    response.set("cache-control", "no-store");
+
+    return response.json({
+      iceServers: token.iceServers,
+      ttl: token.ttl,
+    });
+  } catch (error) {
+    console.error(
+      "TURN credential request failed:",
+      error instanceof Error ? error.message : error
+    );
+
+    return response.status(502).json({
+      error: "Could not create TURN credentials",
+    });
+  }
+});
+
+app.post("/webhooks/calls", async (request, response) => {
   const suppliedSecret =
     request.get("x-global-qall-webhook-secret") || "";
 
@@ -321,27 +385,12 @@ app.post("/webhooks/calls", async (request, response) => {
   try {
     const { caller, tokens } = await loadCallData(call);
 
-	console.log("[VOIP TOKENS] Lookup result", {
-	  callId: call.id,
-	  calleeId: call.callee_id,
-	  environment: APNS_ENVIRONMENT,
-	  tokenCount: tokens.length,
-	  tokenSuffixes: tokens.map(({ token }) => token.slice(-8)),
-	});    
-	
-	if (tokens.length === 0) {
-	  console.warn("[VOIP TOKENS] No active token for callee", {
-	    callId: call.id,
-	    calleeId: call.callee_id,
-	    requiredPlatform: "ios",
-	    requiredEnvironment: APNS_ENVIRONMENT,
-	  });
-
-	  return response.status(202).json({
-	    delivered: 0,
-	    reason: "No active VoIP token for callee",
-	  });
-	}
+    if (tokens.length === 0) {
+      return response.status(202).json({
+        delivered: 0,
+        reason: "No active VoIP token for callee",
+      });
+    }
 
     const callerName =
       caller?.display_name?.trim() ||
@@ -377,16 +426,6 @@ app.post("/webhooks/calls", async (request, response) => {
 
           const reason = result.body?.reason;
 
-          console.log("[APNS RESPONSE]", {
-            tokenSuffix: token.slice(-8),
-            statusCode: result.statusCode,
-            apnsId: result.apnsId,
-            reason: reason ?? null,
-            body: result.body,
-            topic: APNS_TOPIC,
-            environment: APNS_ENVIRONMENT,
-          });
-
           if (
             result.statusCode === 410 ||
             reason === "BadDeviceToken" ||
@@ -419,22 +458,13 @@ app.post("/webhooks/calls", async (request, response) => {
 
     const delivered = results.filter((item) => item.ok).length;
 
-    console.log(
-      "VoIP push result",
-      JSON.stringify(
-        {
-          callId: call.id,
-          delivered,
-          attempted: results.length,
-          apnsHost: APNS_HOST,
-          apnsTopic: APNS_TOPIC,
-          results,
-        },
-        null,
-        2
-      )
-    );
-	
+    console.log("VoIP push result", {
+      callId: call.id,
+      delivered,
+      attempted: results.length,
+      results,
+    });
+
     return response
       .status(delivered > 0 ? 200 : 502)
       .json({
@@ -472,14 +502,8 @@ app.use((error, _request, response, _next) => {
   response.status(500).json({ error: "Internal server error" });
 });
 
-
 app.listen(PORT, () => {
   console.log(
     `Global Qall VoIP push server listening on port ${PORT}`,
   );
-  console.log("VoIP server configuration", {
-    apnsEnvironment: APNS_ENVIRONMENT,
-    apnsHost: APNS_HOST,
-    apnsTopic: APNS_TOPIC,
-  });
 });
