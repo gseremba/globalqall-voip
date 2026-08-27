@@ -165,6 +165,206 @@ function sendApnsRequest(deviceToken, payload, providerToken) {
   });
 }
 
+
+function buildMessagePreview(message) {
+  switch (message?.message_type) {
+    case "image":
+      return "📷 Photo";
+    case "video":
+      return "🎥 Video";
+    case "voice":
+      return "🎤 Voice message";
+    case "file":
+      return message?.file_name
+        ? `📎 ${message.file_name}`
+        : "📎 File";
+    case "system":
+      return String(message?.body || "Group activity")
+        .trim()
+        .slice(0, 180);
+    default:
+      return String(message?.body || "New message")
+        .trim()
+        .slice(0, 180);
+  }
+}
+
+async function deactivateMessagePushToken(
+  expoPushToken,
+  reason
+) {
+  const { error } = await supabase
+    .from("message_push_tokens")
+    .update({
+      is_active: false,
+      invalidated_at: new Date().toISOString(),
+      last_error: reason,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("expo_push_token", expoPushToken);
+
+  if (error) {
+    console.warn(
+      "Could not deactivate message push token:",
+      error.message
+    );
+  }
+}
+
+async function sendExpoPushNotifications(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return [];
+  }
+
+  const results = [];
+
+  for (let offset = 0; offset < messages.length; offset += 100) {
+    const chunk = messages.slice(offset, offset + 100);
+
+    const expoResponse = await fetch(
+      "https://exp.host/--/api/v2/push/send",
+      {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "accept-encoding": "gzip, deflate",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(chunk),
+      }
+    );
+
+    const payload = await expoResponse
+      .json()
+      .catch(() => null);
+
+    if (!expoResponse.ok) {
+      throw new Error(
+        payload?.errors?.[0]?.message ||
+        `Expo push request failed (${expoResponse.status})`
+      );
+    }
+
+    const tickets = Array.isArray(payload?.data)
+      ? payload.data
+      : [];
+
+    for (let index = 0; index < chunk.length; index += 1) {
+      const ticket = tickets[index] || null;
+      const outbound = chunk[index];
+
+      results.push({
+        token: outbound.to,
+        ticket,
+      });
+
+      if (
+        ticket?.status === "error" &&
+        ticket?.details?.error === "DeviceNotRegistered"
+      ) {
+        await deactivateMessagePushToken(
+          outbound.to,
+          "DeviceNotRegistered"
+        );
+      }
+    }
+  }
+
+  return results;
+}
+
+async function loadMessagePushData(messageId) {
+  const { data: message, error: messageError } =
+    await supabase
+      .from("messages")
+      .select(
+        "id, conversation_id, sender_id, body, message_type, file_name, created_at"
+      )
+      .eq("id", messageId)
+      .maybeSingle();
+
+  if (messageError) {
+    throw new Error(
+      `Could not load message: ${messageError.message}`
+    );
+  }
+
+  if (!message) {
+    return null;
+  }
+
+  const [
+    conversationResponse,
+    senderResponse,
+    memberResponse,
+  ] = await Promise.all([
+    supabase
+      .from("conversations")
+      .select("id, conversation_type, name")
+      .eq("id", message.conversation_id)
+      .maybeSingle(),
+
+    supabase
+      .from("profiles")
+      .select("display_name, qall_id")
+      .eq("id", message.sender_id)
+      .maybeSingle(),
+
+    supabase
+      .from("conversation_members")
+      .select("user_id")
+      .eq("conversation_id", message.conversation_id)
+      .neq("user_id", message.sender_id),
+  ]);
+
+  if (conversationResponse.error) {
+    throw new Error(
+      `Could not load conversation: ${conversationResponse.error.message}`
+    );
+  }
+
+  if (senderResponse.error) {
+    throw new Error(
+      `Could not load sender: ${senderResponse.error.message}`
+    );
+  }
+
+  if (memberResponse.error) {
+    throw new Error(
+      `Could not load recipients: ${memberResponse.error.message}`
+    );
+  }
+
+  const recipients = (memberResponse.data || [])
+    .map((row) => row.user_id)
+    .filter(Boolean);
+
+  let tokens = [];
+
+  if (recipients.length > 0) {
+    const { data, error } = await supabase
+      .from("message_push_tokens")
+      .select("user_id, expo_push_token, platform")
+      .in("user_id", recipients)
+      .eq("is_active", true);
+
+    if (error) {
+      throw new Error(
+        `Could not load message push tokens: ${error.message}`
+      );
+    }
+
+    tokens = data || [];
+  }
+
+  return {
+    message,
+    conversation: conversationResponse.data,
+    sender: senderResponse.data,
+    tokens,
+  };
+}
+
 async function requireAuthenticatedUser(request, response) {
   const authorization = request.get("authorization") || "";
   const match = authorization.match(/^Bearer\s+(.+)$/i);
@@ -481,6 +681,140 @@ app.post("/webhooks/calls", async (request, response) => {
         error instanceof Error
           ? error.message
           : "VoIP push failed",
+    });
+  }
+});
+
+
+app.post("/webhooks/messages", async (request, response) => {
+  const suppliedSecret =
+    request.get("x-global-qall-webhook-secret") || "";
+
+  if (!safeEqual(suppliedSecret, process.env.WEBHOOK_SECRET)) {
+    return response.status(401).json({
+      error: "Unauthorized message webhook",
+    });
+  }
+
+  const payload = request.body;
+  const message = payload?.record;
+
+  if (
+    payload?.type !== "INSERT" ||
+    payload?.schema !== "public" ||
+    payload?.table !== "messages" ||
+    !message?.id
+  ) {
+    return response.status(202).json({
+      ignored: true,
+      reason: "Unsupported message webhook event",
+    });
+  }
+
+  try {
+    const data = await loadMessagePushData(message.id);
+
+    if (!data) {
+      return response.status(202).json({
+        delivered: 0,
+        reason: "Message not found",
+      });
+    }
+
+    if (!data.conversation) {
+      return response.status(202).json({
+        delivered: 0,
+        reason: "Conversation not found",
+      });
+    }
+
+    if (data.tokens.length === 0) {
+      return response.status(202).json({
+        delivered: 0,
+        reason: "No active message push tokens",
+      });
+    }
+
+    const senderName =
+      data.sender?.display_name?.trim() ||
+      data.sender?.qall_id ||
+      "Global Qall";
+
+    const isGroup =
+      data.conversation.conversation_type === "group";
+
+    const preview =
+      buildMessagePreview(data.message);
+
+    const title = isGroup
+      ? data.conversation.name || "Global Qall Group"
+      : senderName;
+
+    const body =
+      data.message.message_type === "system"
+        ? preview
+        : isGroup
+          ? `${senderName}: ${preview}`
+          : preview;
+
+    const notifications = data.tokens.map(
+      ({ expo_push_token }) => ({
+        to: expo_push_token,
+        sound: "default",
+        title,
+        body,
+        priority: "high",
+        channelId: "messages",
+        data: {
+          type: "chat_message",
+          conversationId:
+            data.message.conversation_id,
+          messageId: data.message.id,
+          conversationType:
+            data.conversation.conversation_type,
+          senderId: data.message.sender_id,
+          groupName: isGroup
+            ? data.conversation.name || null
+            : null,
+        },
+      })
+    );
+
+    const results =
+      await sendExpoPushNotifications(notifications);
+
+    const accepted = results.filter(
+      ({ ticket }) => ticket?.status === "ok"
+    ).length;
+
+    console.log("[MESSAGE PUSH] Result", {
+      messageId: data.message.id,
+      conversationId:
+        data.message.conversation_id,
+      conversationType:
+        data.conversation.conversation_type,
+      attempted: notifications.length,
+      accepted,
+    });
+
+    return response.status(200).json({
+      messageId: data.message.id,
+      attempted: notifications.length,
+      accepted,
+    });
+  } catch (error) {
+    console.error(
+      "[MESSAGE PUSH] Webhook failed:",
+      error instanceof Error
+        ? error.message
+        : error
+    );
+
+    return response.status(500).json({
+      error:
+        error instanceof Error
+          ? error.message
+          : "Message push failed",
     });
   }
 });
