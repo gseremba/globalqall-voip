@@ -1,4 +1,4 @@
-﻿import "dotenv/config";
+import "dotenv/config";
 import http2 from "node:http2";
 import crypto from "node:crypto";
 import express from "express";
@@ -169,15 +169,15 @@ function sendApnsRequest(deviceToken, payload, providerToken) {
 function buildMessagePreview(message) {
   switch (message?.message_type) {
     case "image":
-      return "ðŸ“· Photo";
+      return "📷 Photo";
     case "video":
-      return "ðŸŽ¥ Video";
+      return "🎥 Video";
     case "voice":
-      return "ðŸŽ¤ Voice message";
+      return "🎤 Voice message";
     case "file":
       return message?.file_name
-        ? `ðŸ“Ž ${message.file_name}`
-        : "ðŸ“Ž File";
+        ? `📎 ${message.file_name}`
+        : "📎 File";
     case "system":
       return String(message?.body || "Group activity")
         .trim()
@@ -836,263 +836,8 @@ app.use((error, _request, response, _next) => {
   response.status(500).json({ error: "Internal server error" });
 });
 
-
-// === SPRINT 12.3C BACKGROUND GROUP CALL NOTIFICATIONS: BEGIN ===
-
-async function loadGroupCallPushData(groupCallRecord) {
-  const { data: caller, error: callerError } = await supabase
-    .from("profiles")
-    .select("display_name, qall_id")
-    .eq("id", groupCallRecord.created_by)
-    .maybeSingle();
-
-  if (callerError) {
-    throw new Error(`Could not load group-call initiator: ${callerError.message}`);
-  }
-
-  const { data: conversation, error: conversationError } = await supabase
-    .from("conversations")
-    .select("id, name")
-    .eq("id", groupCallRecord.conversation_id)
-    .maybeSingle();
-
-  if (conversationError) {
-    throw new Error(`Could not load group conversation: ${conversationError.message}`);
-  }
-
-  const { data: members, error: memberError } = await supabase
-    .from("conversation_members")
-    .select("user_id")
-    .eq("conversation_id", groupCallRecord.conversation_id)
-    .neq("user_id", groupCallRecord.created_by);
-
-  if (memberError) {
-    throw new Error(`Could not load group members: ${memberError.message}`);
-  }
-
-  const recipientIds = [...new Set((members || []).map((row) => row.user_id).filter(Boolean))];
-
-  if (recipientIds.length === 0) {
-    return {
-      caller,
-      conversation,
-      recipientIds: [],
-      tokens: [],
-    };
-  }
-
-  const { data: tokens, error: tokenError } = await supabase
-    .from("voip_push_tokens")
-    .select("token, user_id, environment")
-    .in("user_id", recipientIds)
-    .eq("platform", "ios")
-    .eq("environment", APNS_ENVIRONMENT)
-    .eq("is_active", true);
-
-  if (tokenError) {
-    throw new Error(`Could not load group VoIP tokens: ${tokenError.message}`);
-  }
-
-  return {
-    caller,
-    conversation,
-    recipientIds,
-    tokens: tokens || [],
-  };
-}
-
-app.post("/webhooks/group-calls", async (request, response) => {
-  console.log("[GROUP VOIP WEBHOOK] Request received", {
-    timestamp: new Date().toISOString(),
-    type: request.body?.type || null,
-    schema: request.body?.schema || null,
-    table: request.body?.table || null,
-    groupCallId: request.body?.record?.id || null,
-    status: request.body?.record?.status || null,
-  });
-
-  const suppliedSecret =
-    request.get("x-global-qall-webhook-secret") || "";
-
-  if (!safeEqual(suppliedSecret, process.env.WEBHOOK_SECRET)) {
-    return response.status(401).json({
-      error: "Unauthorized webhook",
-    });
-  }
-
-  const payload = request.body;
-  const groupCall = payload?.record;
-
-  if (
-    payload?.type !== "INSERT" ||
-    payload?.schema !== "public" ||
-    payload?.table !== "group_calls"
-  ) {
-    return response.status(202).json({
-      ignored: true,
-      reason: "Unsupported group-call webhook event",
-    });
-  }
-
-  if (
-    !groupCall?.id ||
-    !groupCall?.conversation_id ||
-    !groupCall?.created_by
-  ) {
-    return response.status(202).json({
-      ignored: true,
-      reason: "Invalid group-call record",
-    });
-  }
-
-  const normalizedStatus = String(groupCall.status || "").toLowerCase();
-  if (normalizedStatus && !["ringing", "active", "started"].includes(normalizedStatus)) {
-    return response.status(202).json({
-      ignored: true,
-      reason: `Group call status is not notifiable: ${normalizedStatus}`,
-    });
-  }
-
-  try {
-    const {
-      caller,
-      conversation,
-      recipientIds,
-      tokens,
-    } = await loadGroupCallPushData(groupCall);
-
-    console.log("[GROUP VOIP TOKENS] Lookup result", {
-      groupCallId: groupCall.id,
-      conversationId: groupCall.conversation_id,
-      recipientCount: recipientIds.length,
-      tokenCount: tokens.length,
-      environment: APNS_ENVIRONMENT,
-      tokenSuffixes: tokens.map(({ token }) => token.slice(-8)),
-    });
-
-    if (tokens.length === 0) {
-      return response.status(202).json({
-        delivered: 0,
-        attempted: 0,
-        recipients: recipientIds.length,
-        reason: "No active VoIP tokens for group recipients",
-      });
-    }
-
-    const initiatorName =
-      caller?.display_name?.trim() ||
-      caller?.qall_id ||
-      "Global Qall user";
-
-    const groupName =
-      conversation?.name?.trim() ||
-      "Global Qall group";
-
-    const callType =
-      groupCall.call_type === "video" ? "video" : "voice";
-
-    const apnsPayload = {
-      aps: {
-        "content-available": 1,
-      },
-
-      // Existing native PushKit bridge understands these generic keys.
-      uuid: groupCall.id,
-      callId: groupCall.id,
-      callerId: groupCall.created_by,
-      callerName: groupName,
-      handle: initiatorName,
-      callType,
-      hasVideo: callType === "video",
-
-      // Sprint 12.3C group-call metadata.
-      isGroupCall: true,
-      groupCallId: groupCall.id,
-      conversationId: groupCall.conversation_id,
-      groupName,
-      initiatorName,
-      expiresAt: groupCall.expires_at || null,
-    };
-
-    const providerToken = await getProviderToken();
-
-    const results = await Promise.all(
-      tokens.map(async ({ token, user_id: userId }) => {
-        try {
-          const result = await sendApnsRequest(
-            token,
-            apnsPayload,
-            providerToken,
-          );
-
-          const reason = result.body?.reason;
-
-          if (
-            result.statusCode === 410 ||
-            reason === "BadDeviceToken" ||
-            reason === "DeviceTokenNotForTopic" ||
-            reason === "Unregistered"
-          ) {
-            await deactivateToken(
-              token,
-              reason || `APNs ${result.statusCode}`,
-            );
-          }
-
-          return {
-            userId,
-            tokenSuffix: token.slice(-8),
-            ...result,
-          };
-        } catch (error) {
-          return {
-            userId,
-            tokenSuffix: token.slice(-8),
-            ok: false,
-            statusCode: 0,
-            error:
-              error instanceof Error
-                ? error.message
-                : String(error),
-          };
-        }
-      }),
-    );
-
-    const delivered = results.filter((item) => item.ok).length;
-
-    console.log("[GROUP VOIP PUSH] Delivery result", {
-      groupCallId: groupCall.id,
-      delivered,
-      attempted: results.length,
-      recipients: recipientIds.length,
-      results,
-    });
-
-    return response.status(delivered > 0 ? 200 : 202).json({
-      delivered,
-      attempted: results.length,
-      recipients: recipientIds.length,
-      results,
-    });
-  } catch (error) {
-    console.error("[GROUP VOIP WEBHOOK] Failed", {
-      groupCallId: groupCall?.id || null,
-      error: error instanceof Error ? error.message : String(error),
-    });
-
-    return response.status(500).json({
-      error: "Group-call VoIP notification failed",
-    });
-  }
-});
-
-// === SPRINT 12.3C BACKGROUND GROUP CALL NOTIFICATIONS: END ===
-
-
 app.listen(PORT, () => {
   console.log(
     `Global Qall VoIP push server listening on port ${PORT}`,
   );
 });
-
