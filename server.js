@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { sendAndroidDirectCallPush } from "./androidDirectCallPush.js";
 import http2 from "node:http2";
 import crypto from "node:crypto";
 import express from "express";
@@ -581,6 +582,20 @@ app.post("/webhooks/calls", async (request, response) => {
       reason: "Not a valid ringing call",
     });
   }
+
+   let androidPushResult = null;
+
+   try {
+     androidPushResult = await sendAndroidDirectCallPush({
+       supabase,
+       call,
+     });
+   } catch (error) {
+     console.warn(
+       "[ANDROID DIRECT CALL PUSH] Failed:",
+       error instanceof Error ? error.message : String(error)
+     );
+   }
 
   try {
     const { caller, tokens } = await loadCallData(call);
