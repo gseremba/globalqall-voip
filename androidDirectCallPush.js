@@ -128,15 +128,16 @@ export async function sendAndroidDirectCallPush({
     ),
   );
 
+  // Sprint 12.5B:
+  // Data-only high-priority push. Do not include title/body/channelId here.
+  // A data-only Android notification can start the Expo notification
+  // background task even when the app is terminated. The task then hands the
+  // call to Android ConnectionService / CallKeep. If native presentation is
+  // unavailable, the app posts its own local notification fallback.
   const messages = tokens.map((token) => ({
     to: token,
     priority: "high",
     ttl: ttlSeconds,
-    channelId: "calls",
-    title: callerName,
-    body: isVideo
-      ? "Incoming video call"
-      : "Incoming voice call",
     data: {
       type: "direct_call",
       callId: call.id,
