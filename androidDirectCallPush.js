@@ -1,45 +1,160 @@
-const EXPO_PUSH_URL =
-  "https://exp.host/--/api/v2/push/send";
+const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
 
 function isExpoPushToken(value) {
   return (
     typeof value === "string" &&
-    (
-      value.startsWith("ExponentPushToken[") ||
-      value.startsWith("ExpoPushToken[")
-    )
+    (value.startsWith("ExponentPushToken[") || value.startsWith("ExpoPushToken["))
   );
 }
 
-async function deactivateMessagePushToken(
-  supabase,
-  expoPushToken,
-  reason,
-) {
+async function deactivateToken(supabase, table, column, token, reason) {
   const { error } = await supabase
-    .from("message_push_tokens")
-    .update({
-      is_active: false,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("expo_push_token", expoPushToken);
+    .from(table)
+    .update({ is_active: false, updated_at: new Date().toISOString() })
+    .eq(column, token);
 
   if (error) {
-    console.warn(
-      "[ANDROID DIRECT CALL PUSH] Could not deactivate token",
-      {
-        tokenSuffix: expoPushToken.slice(-12),
-        reason,
-        error: error.message,
-      },
-    );
+    console.warn("[ANDROID DIRECT CALL PUSH] Could not deactivate token", {
+      table,
+      tokenSuffix: token.slice(-12),
+      reason,
+      error: error.message,
+    });
   }
 }
 
-export async function sendAndroidDirectCallPush({
-  supabase,
-  call,
-}) {
+let firebaseMessagingPromise = null;
+
+async function getFirebaseMessaging() {
+  if (!firebaseMessagingPromise) {
+    firebaseMessagingPromise = (async () => {
+      const { getApps, initializeApp, applicationDefault, cert } =
+        await import("firebase-admin/app");
+      const { getMessaging } = await import("firebase-admin/messaging");
+
+      if (getApps().length === 0) {
+        const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
+
+        if (rawServiceAccount) {
+          initializeApp({ credential: cert(JSON.parse(rawServiceAccount)) });
+        } else {
+          initializeApp({ credential: applicationDefault() });
+        }
+      }
+
+      return getMessaging();
+    })();
+  }
+
+  return firebaseMessagingPromise;
+}
+
+async function sendNativeFcm({ supabase, tokens, data, ttlSeconds }) {
+  if (!tokens.length) {
+    return { attempted: 0, delivered: 0, failed: 0 };
+  }
+
+  const messaging = await getFirebaseMessaging();
+  const response = await messaging.sendEachForMulticast({
+    tokens,
+    data,
+    android: {
+      priority: "high",
+      ttl: ttlSeconds * 1000,
+    },
+  });
+
+  for (let i = 0; i < response.responses.length; i += 1) {
+    const result = response.responses[i];
+    if (result.success) continue;
+
+    const code = result.error?.code || "unknown";
+    if (
+      code === "messaging/registration-token-not-registered" ||
+      code === "messaging/invalid-registration-token"
+    ) {
+      await deactivateToken(
+        supabase,
+        "android_fcm_tokens",
+        "fcm_token",
+        tokens[i],
+        code,
+      );
+    }
+  }
+
+  return {
+    attempted: tokens.length,
+    delivered: response.successCount,
+    failed: response.failureCount,
+  };
+}
+
+async function sendExpoFallback({ supabase, tokens, data, callerName, isVideo, ttlSeconds }) {
+  if (!tokens.length) {
+    return { attempted: 0, delivered: 0, tickets: [] };
+  }
+
+  // This is intentionally a regular notification message, not the removed
+  // Sprint 12.5B headless TaskManager payload. It preserves the known-working
+  // 12.5A Android OS notification path as a fallback.
+  const messages = tokens.map((token) => ({
+    to: token,
+    priority: "high",
+    ttl: ttlSeconds,
+    channelId: "calls",
+    title: callerName,
+    body: isVideo ? "Incoming video call" : "Incoming voice call",
+    data,
+  }));
+
+  const response = await fetch(EXPO_PUSH_URL, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Accept-Encoding": "gzip, deflate",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(messages),
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      `Expo push request failed (${response.status}): ${JSON.stringify(body)}`,
+    );
+  }
+
+  const tickets = Array.isArray(body?.data)
+    ? body.data
+    : body?.data
+      ? [body.data]
+      : [];
+
+  let delivered = 0;
+  for (let i = 0; i < messages.length; i += 1) {
+    const ticket = tickets[i];
+    const token = messages[i].to;
+    if (ticket?.status === "ok") {
+      delivered += 1;
+      continue;
+    }
+
+    if (ticket?.details?.error === "DeviceNotRegistered") {
+      await deactivateToken(
+        supabase,
+        "message_push_tokens",
+        "expo_push_token",
+        token,
+        "DeviceNotRegistered",
+      );
+    }
+  }
+
+  return { attempted: messages.length, delivered, tickets };
+}
+
+export async function sendAndroidDirectCallPush({ supabase, call }) {
   if (
     !call?.id ||
     !call?.caller_id ||
@@ -56,14 +171,19 @@ export async function sendAndroidDirectCallPush({
 
   const [
     { data: caller, error: callerError },
-    { data: tokenRows, error: tokenError },
+    { data: fcmRows, error: fcmError },
+    { data: expoRows, error: expoError },
   ] = await Promise.all([
     supabase
       .from("profiles")
       .select("display_name, qall_id")
       .eq("id", call.caller_id)
       .maybeSingle(),
-
+    supabase
+      .from("android_fcm_tokens")
+      .select("fcm_token")
+      .eq("user_id", call.callee_id)
+      .eq("is_active", true),
     supabase
       .from("message_push_tokens")
       .select("expo_push_token")
@@ -73,143 +193,94 @@ export async function sendAndroidDirectCallPush({
   ]);
 
   if (callerError) {
-    throw new Error(
-      `Could not load Android caller profile: ${callerError.message}`,
-    );
+    throw new Error(`Could not load Android caller profile: ${callerError.message}`);
+  }
+  if (fcmError) {
+    throw new Error(`Could not load Android FCM tokens: ${fcmError.message}`);
+  }
+  if (expoError) {
+    throw new Error(`Could not load Android Expo tokens: ${expoError.message}`);
   }
 
-  if (tokenError) {
-    throw new Error(
-      `Could not load Android push tokens: ${tokenError.message}`,
-    );
-  }
-
-  const tokens = (tokenRows || [])
+  const fcmTokens = (fcmRows || []).map((row) => row.fcm_token).filter(Boolean);
+  const expoTokens = (expoRows || [])
     .map((row) => row.expo_push_token)
     .filter(isExpoPushToken);
 
-  if (tokens.length === 0) {
-    console.log("[ANDROID DIRECT CALL PUSH]", {
-      callId: call.id,
-      calleeId: call.callee_id,
-      attempted: 0,
-      delivered: 0,
-      reason: "No active Android Expo push token",
-    });
-
-    return {
-      attempted: 0,
-      delivered: 0,
-      reason: "No active Android Expo push token",
-    };
-  }
-
   const callerName =
-    caller?.display_name?.trim() ||
-    caller?.qall_id ||
-    "Global Qall caller";
-
-  const qallId =
-    caller?.qall_id || "Global Qall";
-
+    caller?.display_name?.trim() || caller?.qall_id || "Global Qall caller";
+  const qallId = caller?.qall_id || "Global Qall";
   const isVideo = call.call_type === "video";
   const ttlSeconds = Math.max(
     5,
     Math.min(
       60,
       call.expires_at
-        ? Math.floor(
-            (
-              new Date(call.expires_at).getTime() -
-              Date.now()
-            ) / 1000
-          )
+        ? Math.floor((new Date(call.expires_at).getTime() - Date.now()) / 1000)
         : 45,
     ),
   );
 
-  // Sprint 12.5B:
-  // Data-only high-priority push. Do not include title/body/channelId here.
-  // A data-only Android notification can start the Expo notification
-  // background task even when the app is terminated. The task then hands the
-  // call to Android ConnectionService / CallKeep. If native presentation is
-  // unavailable, the app posts its own local notification fallback.
-  const messages = tokens.map((token) => ({
-    to: token,
-    priority: "high",
-    ttl: ttlSeconds,
-    data: {
-      type: "direct_call",
-      callId: call.id,
-      callerId: call.caller_id,
-      callerName,
-      qallId,
-      callType: isVideo ? "video" : "voice",
-      expiresAt: call.expires_at || null,
-    },
-  }));
+  const data = {
+    type: "direct_call",
+    callId: String(call.id),
+    callerId: String(call.caller_id),
+    callerName: String(callerName),
+    qallId: String(qallId),
+    callType: isVideo ? "video" : "voice",
+    expiresAt: String(call.expires_at || ""),
+  };
 
-  const response = await fetch(EXPO_PUSH_URL, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Accept-Encoding": "gzip, deflate",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(messages),
-  });
+  let nativeResult = { attempted: 0, delivered: 0, failed: 0 };
+  let nativeError = null;
 
-  const body = await response
-    .json()
-    .catch(() => ({}));
-
-  if (!response.ok) {
-    throw new Error(
-      `Expo push request failed (${response.status}): ${
-        JSON.stringify(body)
-      }`,
-    );
+  if (fcmTokens.length) {
+    try {
+      nativeResult = await sendNativeFcm({
+        supabase,
+        tokens: fcmTokens,
+        data,
+        ttlSeconds,
+      });
+    } catch (error) {
+      nativeError = error instanceof Error ? error.message : String(error);
+      console.warn("[ANDROID DIRECT CALL FCM] Native FCM failed; using Expo fallback", {
+        callId: call.id,
+        error: nativeError,
+      });
+    }
   }
 
-  const tickets = Array.isArray(body?.data)
-    ? body.data
-    : body?.data
-      ? [body.data]
-      : [];
-
-  let delivered = 0;
-
-  for (let index = 0; index < messages.length; index += 1) {
-    const ticket = tickets[index];
-    const token = messages[index].to;
-
-    if (ticket?.status === "ok") {
-      delivered += 1;
-      continue;
-    }
-
-    const errorCode = ticket?.details?.error || null;
-
-    if (errorCode === "DeviceNotRegistered") {
-      await deactivateMessagePushToken(
-        supabase,
-        token,
-        errorCode,
-      );
-    }
+  // Avoid duplicate ringing when native FCM was successfully accepted.
+  // Use the old Expo notification-bearing path only when native FCM is not
+  // available or failed completely.
+  let expoResult = { attempted: 0, delivered: 0, tickets: [] };
+  if (nativeResult.delivered === 0) {
+    expoResult = await sendExpoFallback({
+      supabase,
+      tokens: expoTokens,
+      data,
+      callerName,
+      isVideo,
+      ttlSeconds,
+    });
   }
 
   console.log("[ANDROID DIRECT CALL PUSH]", {
     callId: call.id,
     calleeId: call.callee_id,
-    attempted: messages.length,
-    acceptedByExpo: delivered,
-    tickets,
+    nativeFcm: nativeResult,
+    nativeError,
+    expoFallback: {
+      attempted: expoResult.attempted,
+      acceptedByExpo: expoResult.delivered,
+    },
   });
 
   return {
-    attempted: messages.length,
-    delivered,
-    tickets,
+    attempted: nativeResult.attempted + expoResult.attempted,
+    delivered: nativeResult.delivered + expoResult.delivered,
+    nativeFcm: nativeResult,
+    expoFallback: expoResult,
   };
 }
