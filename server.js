@@ -560,6 +560,67 @@ app.post("/webhooks/calls", async (request, response) => {
   const payload = request.body;
   const call = payload?.record;
 
+  // Sprint 13.2: independent missed-call branch. The INSERT/ringing path below
+  // is deliberately unchanged, including native Android and iOS call wake-up.
+  if (payload?.type === "UPDATE" && payload?.schema === "public" &&
+      payload?.table === "calls" && call?.status === "missed") {
+    if (!call?.id || !call?.caller_id || !call?.callee_id) {
+      return response.status(202).json({ ignored: true, reason: "Invalid missed call" });
+    }
+    // Verify the current database state rather than trusting a webhook body.
+    try {
+      const { data: current, error: currentError } = await supabase
+        .from("calls")
+        .select("id, caller_id, callee_id, call_type, status, answered_at")
+        .eq("id", call.id).maybeSingle();
+      if (currentError) throw currentError;
+      if (!current || current.status !== "missed" || current.answered_at ||
+          current.caller_id !== call.caller_id || current.callee_id !== call.callee_id) {
+        return response.status(202).json({ ignored: true, reason: "Not a current missed call" });
+      }
+
+      // Unique call_id is the durable, cross-instance duplicate guard.
+      // This is at-most-once delivery: failed pushes are not automatically retried.
+      const { data: claimed, error: claimError } = await supabase
+        .from("missed_call_push_deliveries")
+        .upsert({ call_id: current.id, callee_id: current.callee_id },
+          { onConflict: "call_id", ignoreDuplicates: true })
+        .select("call_id");
+      if (claimError) throw claimError;
+      if (!claimed?.length) {
+        return response.status(200).json({ duplicate: true, callId: current.id });
+      }
+
+      const [callerResult, tokensResult] = await Promise.all([
+        supabase.from("profiles").select("display_name, qall_id")
+          .eq("id", current.caller_id).maybeSingle(),
+        supabase.from("message_push_tokens").select("expo_push_token")
+          .eq("user_id", current.callee_id).eq("is_active", true),
+      ]);
+      if (callerResult.error) throw callerResult.error;
+      if (tokensResult.error) throw tokensResult.error;
+      const callerName = callerResult.data?.display_name?.trim() ||
+        callerResult.data?.qall_id || "Global Qall caller";
+      const tokens = [...new Set((tokensResult.data || []).map(t => t.expo_push_token).filter(Boolean))];
+      const notifications = tokens.map(to => ({
+        to, sound: "default", priority: "high", channelId: "messages",
+        title: `Missed ${current.call_type === "video" ? "video" : "voice"} call`,
+        body: `From ${callerName}`,
+        data: { type: "missed_call", callId: current.id,
+          callerId: current.caller_id, callType: current.call_type },
+      }));
+      const results = await sendExpoPushNotifications(notifications);
+      const accepted = results.filter(r => r.ticket?.status === "ok").length;
+      await supabase.from("missed_call_push_deliveries")
+        .update({ processed_at: new Date().toISOString(), attempted: tokens.length, accepted })
+        .eq("call_id", current.id);
+      return response.status(200).json({ callId: current.id, attempted: tokens.length, accepted });
+    } catch (error) {
+      console.error("[MISSED CALL PUSH] Failed:", error);
+      return response.status(500).json({ error: "Missed call push failed" });
+    }
+  }
+
   if (
     payload?.type !== "INSERT" ||
     payload?.schema !== "public" ||
