@@ -644,6 +644,41 @@ app.post("/webhooks/calls", async (request, response) => {
     });
   }
 
+  // Sprint 14.2C: verify the persisted call and current block state before
+  // either Android FCM or iOS PushKit. Fail closed if verification fails.
+  try {
+    const { data: persistedCall, error: callLookupError } = await supabase
+      .from("calls")
+      .select("id, caller_id, callee_id, status")
+      .eq("id", call.id)
+      .maybeSingle();
+
+    if (callLookupError) throw callLookupError;
+    if (!persistedCall || persistedCall.status !== "ringing" ||
+        persistedCall.caller_id !== call.caller_id ||
+        persistedCall.callee_id !== call.callee_id) {
+      return response.status(202).json({ ignored: true, reason: "Call no longer ringing" });
+    }
+
+    const { data: blockedRows, error: blockedLookupError } = await supabase
+      .from("blocked_users")
+      .select("id")
+      .or(
+        `and(blocker_id.eq.${call.caller_id},blocked_user_id.eq.${call.callee_id}),` +
+        `and(blocker_id.eq.${call.callee_id},blocked_user_id.eq.${call.caller_id})`
+      )
+      .limit(1);
+
+    if (blockedLookupError) throw blockedLookupError;
+    if (blockedRows?.length) {
+      return response.status(202).json({ ignored: true, reason: "Call blocked" });
+    }
+  } catch (error) {
+    console.error("[CALL BLOCK CHECK] Suppressed push:",
+      error instanceof Error ? error.message : String(error));
+    return response.status(503).json({ error: "Call push verification failed" });
+  }
+
    let androidPushResult = null;
 
    try {
